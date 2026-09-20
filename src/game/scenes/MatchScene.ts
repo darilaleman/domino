@@ -30,8 +30,8 @@ interface SerializedBoardTile { v1: number; v2: number; box: Box; rotation: numb
 
 interface MatchState {
     orientation: Orientation;
-    hands: SerializedTile[][];        // hands[playerIndex] = fichas de cada mano
-    deck: SerializedTile[];           // normalmente vacío
+    hands: SerializedTile[][];
+    deck: SerializedTile[];
     currentPlayerIndex: number;
     boardTiles: SerializedBoardTile[];
     leftEndValue: number | null;
@@ -46,7 +46,7 @@ export class MatchScene extends Scene {
     private deck: Tile[] = [];
     private currentPlayerIndex = 0;
     private boardTiles: Tile[] = [];
-    private boardBoxes = new Map<Tile, Box>();   // NUEVO: caja de cada ficha del tablero
+    private boardBoxes = new Map<Tile, Box>();
     private isProcessingTurn = false;
     private leftEndValue: number | null = null;
     private rightEndValue: number | null = null;
@@ -70,18 +70,20 @@ export class MatchScene extends Scene {
     private safeArea!: Phaser.Geom.Rectangle;
     private handZones = new Map<Tile, Phaser.GameObjects.Zone>();
 
-    private pendingState: MatchState | undefined;   // NUEVO: estado a restaurar
+    private pendingState: MatchState | undefined;
     private isEnding = false;
+
+    // --- Overlay final ---
+    private endOverlay?: Phaser.GameObjects.Container;
+    private lastWinnerIndex = -1;
+    private lastHeadline = '';
 
     constructor() { super('MatchScene'); }
 
-    // --- init reescrito ---
     init(_data?: { state?: MatchState }) {
         this.resetSceneState();
         this.isEnding = false;
 
-        // Fuente única de verdad: el registry. Si hay algo, es un restore real.
-        // Lo consumimos y lo borramos en el mismo paso.
         const restore = this.registry.get(REGISTRY_KEY) as MatchState | undefined;
         this.pendingState = restore;
         if (restore) this.registry.remove(REGISTRY_KEY);
@@ -101,6 +103,9 @@ export class MatchScene extends Scene {
         this.handZones = new Map();
         this.passStreak = 0;
         this.choiceContainer = undefined;
+        this.endOverlay = undefined;
+        this.lastWinnerIndex = -1;
+        this.lastHeadline = '';
         this.leftEnd = { head: { gx: 0, gy: 0 }, dir: { dx: -1, dy: 0 }, turn: { dx: 0, dy: -1 }, lastDouble: false };
         this.rightEnd = { head: { gx: 0, gy: 0 }, dir: { dx: 1, dy: 0 }, turn: { dx: 0, dy: 1 }, lastDouble: false };
     }
@@ -109,14 +114,13 @@ export class MatchScene extends Scene {
         const { width, height } = this.cameras.main;
         this.isLandscape = width > height;
 
-        // --- Fondo de la mesa (antes que cualquier otro objeto) ---
+        // --- Fondo de la mesa ---
         const tableKey = this.isLandscape ? 'table-bg-landscape' : 'table-bg-portrait';
         if (this.textures.exists(tableKey)) {
             const bg = this.add.image(width / 2, height / 2, tableKey).setDepth(-10);
-            const s = Math.max(width / bg.width, height / bg.height);   // cover
+            const s = Math.max(width / bg.width, height / bg.height);
             bg.setScale(s);
         } else {
-            // Fallback: color plano si falta la imagen
             this.add.rectangle(0, 0, width, height, 0x0d2b18).setOrigin(0).setDepth(-10);
         }
 
@@ -185,12 +189,18 @@ export class MatchScene extends Scene {
     }
 
     // ---------- Cambio de orientación ----------
-    // --- handleResize: blindado contra el final de partida ---
     private handleResize(gameSize: Phaser.Structs.Size) {
-        if (this.isEnding) return;                       // <-- NUEVO: nada durante el cierre
-        if (!this.scene.isActive()) return;              // <-- NUEVO: nada si ya está saliendo
+        if (!this.scene.isActive()) return;
 
         const newLandscape = gameSize.width > gameSize.height;
+
+        // Si la partida terminó y hay overlay, lo reconstruimos con el nuevo tamaño.
+        if (this.isEnding) {
+            this.isLandscape = newLandscape;
+            this.buildEndOverlay();
+            return;
+        }
+
         if (newLandscape === this.isLandscape) return;
 
         if (this.isProcessingTurn) {
@@ -198,9 +208,8 @@ export class MatchScene extends Scene {
             return;
         }
 
-        // Guardamos en el registry, NO en scene data.
         this.registry.set(REGISTRY_KEY, this.saveState());
-        this.scene.restart();                            // <-- restart SIN data
+        this.scene.restart();
     }
 
     private saveState(): MatchState {
@@ -235,7 +244,6 @@ export class MatchScene extends Scene {
         const currentOrientation: Orientation = this.isLandscape ? 'landscape' : 'portrait';
         const orientationChanged = state.orientation !== currentOrientation;
 
-        // 1) Manos y mazo (como objetos Tile, aún sin sprite)
         this.players = state.hands.map((tiles, idx) => {
             const hand = new PlayerHand(idx > 0);
             tiles.forEach(td => hand.addTile(new Tile(td.v1, td.v2)));
@@ -243,7 +251,6 @@ export class MatchScene extends Scene {
         });
         this.deck = state.deck.map(td => new Tile(td.v1, td.v2));
 
-        // 2) Valores simples
         this.currentPlayerIndex = state.currentPlayerIndex;
         this.passStreak = state.passStreak;
         this.leftEndValue = state.leftEndValue;
@@ -252,21 +259,18 @@ export class MatchScene extends Scene {
         this.rightEnd = this.cloneEnd(state.rightEnd);
         this.isProcessingTurn = false;
 
-        // 3) Transformar si cambió la orientación
         let boardTilesData = state.boardTiles;
         if (orientationChanged) {
             boardTilesData = state.boardTiles.map(bt => ({
                 v1: bt.v1,
                 v2: bt.v2,
                 box: this.transformBox(bt.box, state.orientation),
-                // Rotación del sprite: CW suma +90°, CCW resta -90°
                 rotation: bt.rotation + (state.orientation === 'landscape' ? Math.PI / 2 : -Math.PI / 2)
             }));
             this.leftEnd = this.transformEnd(this.leftEnd, state.orientation);
             this.rightEnd = this.transformEnd(this.rightEnd, state.orientation);
         }
 
-        // 4) Reconstruir fichas del tablero
         this.boardTiles = [];
         this.boardBoxes = new Map();
         this.occupied = new Set();
@@ -284,20 +288,12 @@ export class MatchScene extends Scene {
             this.boardBoxes.set(tile, { ...bt.box });
         }
 
-        // 5) Manos de nuevo
         this.renderPlayerHand();
         this.renderBotHands();
-
-        // 6) Reanudar turno
         this.beginTurn();
     }
 
     // ---------- Transformaciones de orientación ----------
-    /**
-     * Landscape (60×20) → Portrait (20×60): rotación 90° CW del tablero.
-     * Portrait  (20×60) → Landscape (60×20): rotación 90° CCW.
-     * Fórmulas verificadas para que la ficha inicial quede idéntica.
-     */
     private transformBox(box: Box, from: Orientation): Box {
         if (from === 'landscape') {
             return {
@@ -326,10 +322,8 @@ export class MatchScene extends Scene {
 
     private transformDir(d: Dir, from: Orientation): Dir {
         if (from === 'landscape') {
-            // (dx, dy) → (-dy, dx)
             return { dx: -d.dy, dy: d.dx };
         } else {
-            // (dx, dy) → (dy, -dx)
             return { dx: d.dy, dy: -d.dx };
         }
     }
@@ -386,7 +380,7 @@ export class MatchScene extends Scene {
                 .setDepth(60)
                 .setInteractive({ useHandCursor: true });
             zone.on('pointerdown', () => {
-                if (this.currentPlayerIndex === 0 && !this.isProcessingTurn)
+                if (this.currentPlayerIndex === 0 && !this.isProcessingTurn && !this.isEnding)
                     this.humanPlayTile(tile);
             });
             this.handZones.set(tile, zone);
@@ -622,7 +616,7 @@ export class MatchScene extends Scene {
 
         this.occupy(box);
         this.boardTiles.push(tile);
-        this.boardBoxes.set(tile, box);   // NUEVO
+        this.boardBoxes.set(tile, box);
         await this.tweenTile(tile, this.boxCenterWorld(box), rotation);
         this.afterPlay(playerIndex);
     }
@@ -653,7 +647,7 @@ export class MatchScene extends Scene {
 
         this.occupy(placement.box);
         this.boardTiles.push(tile);
-        this.boardBoxes.set(tile, placement.box);   // NUEVO
+        this.boardBoxes.set(tile, placement.box);
 
         const outer = (tile.value1 === connecting) ? tile.value2 : tile.value1;
         if (isRight) { this.rightEnd = placement.newEnd; this.rightEndValue = outer; }
@@ -684,6 +678,7 @@ export class MatchScene extends Scene {
     }
 
     private async humanPlayTile(tile: Tile) {
+        if (this.isEnding) return;
         if (this.isProcessingTurn) return;
 
         if (this.boardTiles.length === 0) {
@@ -715,10 +710,10 @@ export class MatchScene extends Scene {
         const label = this.add.text(0, -42, '¿Por dónde quieres jugar?',
             { fontSize: '16px', color: '#fff' }).setOrigin(0.5);
         const leftBtn = this.add.rectangle(-75, 15, 120, 44, 0x2266cc).setInteractive({ useHandCursor: true });
-        const leftText = this.add.text(-75, 15, `Izquierda\n(${this.leftEndValue})`,
+        const leftText = this.add.text(-75, 15, `(${this.leftEndValue})`,
             { fontSize: '13px', color: '#fff', align: 'center' }).setOrigin(0.5);
         const rightBtn = this.add.rectangle(75, 15, 120, 44, 0x2266cc).setInteractive({ useHandCursor: true });
-        const rightText = this.add.text(75, 15, `Derecha\n(${this.rightEndValue})`,
+        const rightText = this.add.text(75, 15, `(${this.rightEndValue})`,
             { fontSize: '13px', color: '#fff', align: 'center' }).setOrigin(0.5);
         container.add([bg, label, leftBtn, leftText, rightBtn, rightText]);
         this.choiceContainer = container;
@@ -735,11 +730,13 @@ export class MatchScene extends Scene {
 
     // ---------- Turnos ----------
     private nextTurn() {
+        if (this.isEnding) return;
         this.currentPlayerIndex = (this.currentPlayerIndex + 1) % 4;
         this.beginTurn();
     }
 
     private beginTurn() {
+        if (this.isEnding) return;
         this.isProcessingTurn = false;
         this.updateTurnUI();
         if (this.currentPlayerIndex !== 0) {
@@ -751,6 +748,7 @@ export class MatchScene extends Scene {
     }
 
     private registerPass() {
+        if (this.isEnding) return;
         this.passStreak++;
         if (this.passStreak >= 4) { this.endGameBlocked(); return; }
         this.nextTurn();
@@ -766,35 +764,177 @@ export class MatchScene extends Scene {
             winner === 0 ? '¡Trancado! Ganaste por puntos.' : `¡Trancado! Gana Bot ${winner}.`);
     }
 
-    private buildPipSummary(): string {
-        const names = ['Tú', 'Bot 1', 'Bot 2', 'Bot 3'];
-        return this.players.map((h, i) => {
-            const sum = h.tiles.reduce((a, t) => a + t.value1 + t.value2, 0);
-            return `${names[i]}: ${sum} pts`;
-        }).join('   |   ');
-    }
-
     private revealAllHands() {
         this.players.forEach(h => h.tiles.forEach(t => t.setFaceDown(false)));
     }
 
-    // --- showRoundSummaryAndEnd: marca el final inmediatamente ---
+    // ---------- Overlay fin de partida ----------
     private showRoundSummaryAndEnd(winnerIndex: number, headline: string) {
-        this.isEnding = true;                            // <-- NUEVO: bloquea resize YA
+        this.isEnding = true;
         this.revealAllHands();
-        const { width, height } = this.cameras.main;
-        const summary = this.buildPipSummary();
-        this.turnText.setText(headline);
-        const summaryText = this.add.text(width / 2, height / 2, summary, {
-            fontSize: '20px', color: '#fff', backgroundColor: '#000',
-            padding: { x: 16, y: 10 }, align: 'center'
-        }).setOrigin(0.5).setDepth(200);
-        this.time.delayedCall(3000, () => {
-            summaryText.destroy();
-            this.endGame(winnerIndex);
-        });
+        this.lastWinnerIndex = winnerIndex;
+        this.lastHeadline = headline;
+        this.buildEndOverlay();
     }
 
+    private buildEndOverlay() {
+        this.endOverlay?.destroy();
+        this.endOverlay = undefined;
+
+        const { width, height } = this.cameras.main;
+        const isLandscape = width > height;
+
+        const overlay = this.add.container(0, 0).setDepth(500);
+
+        // --- Parámetros de layout ---
+        const padX = isLandscape ? 24 : 16;
+        const padY = isLandscape ? 18 : 14;
+
+        const titleSize = isLandscape ? 26 : 22;
+        let scoreSize = isLandscape ? 20 : 18;
+        let scoreLineSpacing = isLandscape ? 8 : 6;
+
+        const btnH = isLandscape ? 46 : 44;
+        const btnGap = isLandscape ? 20 : 12;
+        const btnBlockH = isLandscape ? btnH : btnH * 2 + btnGap;
+
+        const gapTitleScores = isLandscape ? 14 : 12;
+        const gapScoresButtons = 18;
+
+        // --- Límites del panel ---
+        const maxPanelW = isLandscape ? Math.min(width * 0.85, 640) : width * 0.92;
+        const maxPanelH = isLandscape ? height * 0.92 : height * 0.85;
+
+        // --- Título (se crea para medir su altura real) ---
+        const humanWon = this.lastWinnerIndex === 0;
+        const titleStr = humanWon ? '¡Felicidades, ganaste!' : this.lastHeadline;
+        const titleColor = humanWon ? '#ffe600' : '#ffffff';
+
+        const titleText = this.add.text(0, 0, titleStr, {
+            fontSize: `${titleSize}px`,
+            color: titleColor,
+            fontStyle: 'bold',
+            stroke: '#000000',
+            strokeThickness: 4,
+            align: 'center',
+            wordWrap: { width: maxPanelW - padX * 2 }
+        }).setOrigin(0.5);
+        const titleH = titleText.height;
+
+        // --- Puntuaciones ---
+        const names = ['Tú', 'Bot 1', 'Bot 2', 'Bot 3'];
+        const lines: string[] = this.players.map((h, i) => {
+            const sum = h.tiles.reduce((a, t) => a + t.value1 + t.value2, 0);
+            const marker = i === this.lastWinnerIndex ? '  ←' : '';
+            return `${names[i]}: ${sum} pts${marker}`;
+        });
+
+        const computeScoresH = () => {
+            const lineH = scoreSize * 1.35;
+            return lines.length * lineH + (lines.length - 1) * scoreLineSpacing;
+        };
+
+        // --- Altura necesaria ---
+        const fixedH = padY + titleH + gapTitleScores + gapScoresButtons + btnBlockH + padY;
+        let scoresH = computeScoresH();
+
+        // Si no cabe, se reducen las puntuaciones proporcionalmente
+        if (fixedH + scoresH > maxPanelH) {
+            const available = Math.max(40, maxPanelH - fixedH);
+            const ratio = Math.max(0.5, available / scoresH);
+            scoreSize = Math.max(11, Math.round(scoreSize * ratio));
+            scoreLineSpacing = Math.max(2, Math.round(scoreLineSpacing * ratio));
+            scoresH = computeScoresH();
+        }
+
+        const requiredH = fixedH + scoresH;
+        const panelH = Math.min(maxPanelH, Math.max(requiredH, 200));
+        const panelW = maxPanelW;
+
+        const px = width / 2 - panelW / 2;
+        const py = height / 2 - panelH / 2;
+
+        // --- Fondo oscuro global ---
+        const dim = this.add.rectangle(0, 0, width, height, 0x000000, 0.55).setOrigin(0);
+        overlay.add(dim);
+
+        // --- Panel ---
+        const panel = this.add.rectangle(px, py, panelW, panelH, 0x000000, 0.85)
+            .setOrigin(0)
+            .setStrokeStyle(3, 0xffffff, 0.9);
+        overlay.add(panel);
+
+        // --- Título ---
+        titleText.setPosition(width / 2, py + padY + titleH / 2);
+        overlay.add(titleText);
+
+        // --- Puntuaciones ---
+        const scoresY = py + padY + titleH + gapTitleScores;
+        const scoresText = this.add.text(width / 2, scoresY, lines.join('\n'), {
+            fontSize: `${scoreSize}px`,
+            color: '#ffffff',
+            align: 'center',
+            lineSpacing: scoreLineSpacing
+        }).setOrigin(0.5, 0);
+        overlay.add(scoresText);
+
+        // --- Botones (anclados al fondo del panel) ---
+        const btnW = isLandscape
+            ? Math.min(220, (panelW - padX * 2 - btnGap) / 2)
+            : Math.min(260, panelW - padX * 2);
+        const btnBottomY = py + panelH - padY - btnH / 2;
+
+        let replayX: number, replayY: number, cancelX: number, cancelY: number;
+
+        if (isLandscape) {
+            const totalW = btnW * 2 + btnGap;
+            const startX = width / 2 - totalW / 2 + btnW / 2;
+            replayX = startX;
+            cancelX = startX + btnW + btnGap;
+            replayY = cancelY = btnBottomY;
+        } else {
+            replayX = cancelX = width / 2;
+            cancelY = btnBottomY;
+            replayY = btnBottomY - btnH - btnGap;
+        }
+
+        const replayBg = this.add.rectangle(replayX, replayY, btnW, btnH, 0x00aa44)
+            .setStrokeStyle(2, 0xffffff)
+            .setInteractive({ useHandCursor: true });
+        const replayText = this.add.text(replayX, replayY, 'VOLVER A JUGAR', {
+            fontSize: isLandscape ? '16px' : '15px',
+            color: '#ffffff',
+            fontStyle: 'bold'
+        }).setOrigin(0.5);
+        overlay.add([replayBg, replayText]);
+
+        const cancelBg = this.add.rectangle(cancelX, cancelY, btnW, btnH, 0xaa2222)
+            .setStrokeStyle(2, 0xffffff)
+            .setInteractive({ useHandCursor: true });
+        const cancelText = this.add.text(cancelX, cancelY, 'CANCELAR', {
+            fontSize: isLandscape ? '16px' : '15px',
+            color: '#ffffff',
+            fontStyle: 'bold'
+        }).setOrigin(0.5);
+        overlay.add([cancelBg, cancelText]);
+
+        replayBg.on('pointerdown', () => this.restartMatch());
+        cancelBg.on('pointerdown', () => this.goToMenu());
+
+        this.endOverlay = overlay;
+    }
+
+    private restartMatch() {
+        this.registry.remove(REGISTRY_KEY);
+        this.scene.restart();
+    }
+
+    private goToMenu() {
+        this.registry.remove(REGISTRY_KEY);
+        this.scene.start('MenuScene');
+    }
+
+    // ---------- UI auxiliar ----------
     private updateTurnUI() {
         const names = ['Tu Turno', 'Bot 1', 'Bot 2', 'Bot 3'];
         this.turnText.setText(names[this.currentPlayerIndex]);
@@ -811,6 +951,7 @@ export class MatchScene extends Scene {
     }
 
     private botPlay() {
+        if (this.isEnding) return;
         const idx = this.currentPlayerIndex;
         const botHand = this.players[idx];
         let played = false;
@@ -827,11 +968,5 @@ export class MatchScene extends Scene {
             this.turnText.setText(`Bot ${idx} pasa.`);
             this.time.delayedCall(1500, () => this.registerPass());
         }
-    }
-
-    // --- endGame: por si acaso, vuelve a bloquear resize ---
-    private endGame(winnerIndex: number) {
-        this.isEnding = true;
-        this.scene.start('GameOverScene', { score: winnerIndex === 0 ? 100 : 0 });
     }
 }
