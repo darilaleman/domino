@@ -10,7 +10,7 @@ html, body {
     touch-action: none;
 }
 
-#app {
+#game-container {
     /* dvh = dynamic viewport height: se ajusta cuando aparece/desaparece
        la barra del navegador en móvil. Fallback a vh para navegadores viejos. */
     width: 100vw;
