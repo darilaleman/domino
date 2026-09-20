@@ -375,7 +375,6 @@ import Phaser from 'phaser';
 import { BootScene } from './game/scenes/BootScene';
 import { MenuScene } from './game/scenes/MenuScene';
 import { MatchScene } from './game/scenes/MatchScene';
-import { GameOverScene } from './game/scenes/GameOverScene';
 import { WebTestPlatform } from './cubaplay/WebTestPlatform';
 
 export const platform = new WebTestPlatform();
