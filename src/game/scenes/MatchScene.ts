@@ -6,26 +6,15 @@ type Vec2 = { x: number; y: number };
 type Dir = { dx: number; dy: number };
 type GridPos = { gx: number; gy: number };
 type Box = { gx: number; gy: number; gw: number; gh: number };
+type Orientation = 'landscape' | 'portrait';
 
-// Mesa: 60 x 20 celdas (apaisado) o 20 x 60 (vertical).
 const TABLE_LONG = 60;
 const TABLE_SHORT = 20;
-// Ficha = 4 celdas de largo x 2 de ancho.
 const LONG = 4;
 const SHORT = 2;
 const DEBUG_GRID = false;
+const REGISTRY_KEY = 'match_restore_state';
 
-/**
- * Sistema de coordenadas LOCAL de cada extremo (u, v):
- *   origen = head (vértice donde termina la hilera, sobre la línea central)
- *   u = a lo largo de dir  (u > 0 = hacia afuera, u < 0 = hacia la hilera)
- *   v = a lo largo de turn (v > 0 = hacia donde se doblará la serpiente)
- *   La hilera ocupa v en [-1, 1]; un doble ocupa v en [-2, 2].
- *
- * lastDouble: la última ficha de la hilera es un doble.
- * afterElbow: el codo ya se puso; la próxima ficha arranca la hilera de regreso.
- *             En ese caso head/dir/turn/lastDouble siguen siendo los del marco VIEJO.
- */
 interface EndState {
     head: GridPos;
     dir: Dir;
@@ -35,16 +24,33 @@ interface EndState {
 }
 interface Placement { box: Box; rotation: number; newEnd: EndState; }
 
+// ---------- Estado serializable ----------
+interface SerializedTile { v1: number; v2: number; }
+interface SerializedBoardTile { v1: number; v2: number; box: Box; rotation: number; }
+
+interface MatchState {
+    orientation: Orientation;
+    hands: SerializedTile[][];        // hands[playerIndex] = fichas de cada mano
+    deck: SerializedTile[];           // normalmente vacío
+    currentPlayerIndex: number;
+    boardTiles: SerializedBoardTile[];
+    leftEndValue: number | null;
+    rightEndValue: number | null;
+    leftEnd: EndState;
+    rightEnd: EndState;
+    passStreak: number;
+}
+
 export class MatchScene extends Scene {
     private players: PlayerHand[] = [];
     private deck: Tile[] = [];
     private currentPlayerIndex = 0;
     private boardTiles: Tile[] = [];
+    private boardBoxes = new Map<Tile, Box>();   // NUEVO: caja de cada ficha del tablero
     private isProcessingTurn = false;
     private leftEndValue: number | null = null;
     private rightEndValue: number | null = null;
 
-    // Grid
     private gridOrigin: Vec2 = { x: 0, y: 0 };
     private gridCols = 0;
     private gridRows = 0;
@@ -54,8 +60,8 @@ export class MatchScene extends Scene {
     private botScale = 0.6;
     private occupied = new Set<string>();
 
-    private leftEnd: EndState  = { head: { gx: 0, gy: 0 }, dir: { dx: -1, dy: 0 }, turn: { dx: 0, dy: -1 }, lastDouble: false };
-    private rightEnd: EndState = { head: { gx: 0, gy: 0 }, dir: { dx:  1, dy: 0 }, turn: { dx: 0, dy:  1 }, lastDouble: false };
+    private leftEnd: EndState = { head: { gx: 0, gy: 0 }, dir: { dx: -1, dy: 0 }, turn: { dx: 0, dy: -1 }, lastDouble: false };
+    private rightEnd: EndState = { head: { gx: 0, gy: 0 }, dir: { dx: 1, dy: 0 }, turn: { dx: 0, dy: 1 }, lastDouble: false };
 
     private isLandscape = false;
     private passStreak = 0;
@@ -64,30 +70,55 @@ export class MatchScene extends Scene {
     private safeArea!: Phaser.Geom.Rectangle;
     private handZones = new Map<Tile, Phaser.GameObjects.Zone>();
 
+    private pendingState: MatchState | undefined;   // NUEVO: estado a restaurar
+    private isEnding = false;
+
     constructor() { super('MatchScene'); }
 
-    init() {
-    this.players = [];
-    this.deck = [];
-    this.currentPlayerIndex = 0;
-    this.boardTiles = [];
-    this.isProcessingTurn = false;
-    this.leftEndValue = null;
-    this.rightEndValue = null;
-    this.occupied = new Set<string>();
-    this.handZones = new Map();
-    this.passStreak = 0;
-    this.choiceContainer = undefined;
-    this.leftEnd  = { head: { gx: 0, gy: 0 }, dir: { dx: -1, dy: 0 }, turn: { dx: 0, dy: -1 }, lastDouble: false };
-    this.rightEnd = { head: { gx: 0, gy: 0 }, dir: { dx:  1, dy: 0 }, turn: { dx: 0, dy:  1 }, lastDouble: false };
-}
+    // --- init reescrito ---
+    init(_data?: { state?: MatchState }) {
+        this.resetSceneState();
+        this.isEnding = false;
+
+        // Fuente única de verdad: el registry. Si hay algo, es un restore real.
+        // Lo consumimos y lo borramos en el mismo paso.
+        const restore = this.registry.get(REGISTRY_KEY) as MatchState | undefined;
+        this.pendingState = restore;
+        if (restore) this.registry.remove(REGISTRY_KEY);
+    }
+
+    private resetSceneState() {
+        this.players = [];
+        this.deck = [];
+        this.currentPlayerIndex = 0;
+        this.boardTiles = [];
+        this.boardBoxes = new Map();
+        this.isProcessingTurn = false;
+        this.isEnding = false;
+        this.leftEndValue = null;
+        this.rightEndValue = null;
+        this.occupied = new Set<string>();
+        this.handZones = new Map();
+        this.passStreak = 0;
+        this.choiceContainer = undefined;
+        this.leftEnd = { head: { gx: 0, gy: 0 }, dir: { dx: -1, dy: 0 }, turn: { dx: 0, dy: -1 }, lastDouble: false };
+        this.rightEnd = { head: { gx: 0, gy: 0 }, dir: { dx: 1, dy: 0 }, turn: { dx: 0, dy: 1 }, lastDouble: false };
+    }
 
     create() {
-        this.generateDeck();
-        this.dealTiles();
-
         const { width, height } = this.cameras.main;
         this.isLandscape = width > height;
+
+        // --- Fondo de la mesa (antes que cualquier otro objeto) ---
+        const tableKey = this.isLandscape ? 'table-bg-landscape' : 'table-bg-portrait';
+        if (this.textures.exists(tableKey)) {
+            const bg = this.add.image(width / 2, height / 2, tableKey).setDepth(-10);
+            const s = Math.max(width / bg.width, height / bg.height);   // cover
+            bg.setScale(s);
+        } else {
+            // Fallback: color plano si falta la imagen
+            this.add.rectangle(0, 0, width, height, 0x0d2b18).setOrigin(0).setDepth(-10);
+        }
 
         this.handScale = Math.min(1, (width - 20) / (7 * (TILE_W + 6)), (height * 0.18) / TILE_H);
         this.botScale = this.handScale * 0.6;
@@ -122,10 +153,10 @@ export class MatchScene extends Scene {
             border.lineStyle(1, 0xffffff, 0.12);
             for (let c = 0; c <= this.gridCols; c++)
                 border.lineBetween(this.gridOrigin.x + c * this.cell, this.gridOrigin.y,
-                                   this.gridOrigin.x + c * this.cell, this.gridOrigin.y + gridH);
+                    this.gridOrigin.x + c * this.cell, this.gridOrigin.y + gridH);
             for (let r = 0; r <= this.gridRows; r++)
                 border.lineBetween(this.gridOrigin.x, this.gridOrigin.y + r * this.cell,
-                                   this.gridOrigin.x + gridW, this.gridOrigin.y + r * this.cell);
+                    this.gridOrigin.x + gridW, this.gridOrigin.y + r * this.cell);
         }
 
         this.turnText = this.add.text(width / 2, 20, 'Esperando...', {
@@ -133,9 +164,184 @@ export class MatchScene extends Scene {
             padding: { x: 10, y: 5 }
         }).setOrigin(0.5).setDepth(100);
 
+        // --- Listener de orientación ---
+        this.scale.on('resize', this.handleResize, this);
+        this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
+            this.scale.off('resize', this.handleResize, this);
+        });
+
+        // --- Restaurar partida o iniciar nueva ---
+        if (this.pendingState) {
+            const s = this.pendingState;
+            this.pendingState = undefined;
+            this.restoreGame(s);
+        } else {
+            this.generateDeck();
+            this.dealTiles();
+            this.renderPlayerHand();
+            this.renderBotHands();
+            this.startGame();
+        }
+    }
+
+    // ---------- Cambio de orientación ----------
+    // --- handleResize: blindado contra el final de partida ---
+    private handleResize(gameSize: Phaser.Structs.Size) {
+        if (this.isEnding) return;                       // <-- NUEVO: nada durante el cierre
+        if (!this.scene.isActive()) return;              // <-- NUEVO: nada si ya está saliendo
+
+        const newLandscape = gameSize.width > gameSize.height;
+        if (newLandscape === this.isLandscape) return;
+
+        if (this.isProcessingTurn) {
+            this.time.delayedCall(100, () => this.handleResize(gameSize));
+            return;
+        }
+
+        // Guardamos en el registry, NO en scene data.
+        this.registry.set(REGISTRY_KEY, this.saveState());
+        this.scene.restart();                            // <-- restart SIN data
+    }
+
+    private saveState(): MatchState {
+        return {
+            orientation: this.isLandscape ? 'landscape' : 'portrait',
+            hands: this.players.map(h => h.tiles.map(t => ({ v1: t.value1, v2: t.value2 }))),
+            deck: this.deck.map(t => ({ v1: t.value1, v2: t.value2 })),
+            currentPlayerIndex: this.currentPlayerIndex,
+            boardTiles: this.boardTiles.map(t => {
+                const box = this.boardBoxes.get(t)!;
+                return { v1: t.value1, v2: t.value2, box: { ...box }, rotation: t.sprite.rotation };
+            }),
+            leftEndValue: this.leftEndValue,
+            rightEndValue: this.rightEndValue,
+            leftEnd: this.cloneEnd(this.leftEnd),
+            rightEnd: this.cloneEnd(this.rightEnd),
+            passStreak: this.passStreak
+        };
+    }
+
+    private cloneEnd(e: EndState): EndState {
+        return {
+            head: { ...e.head },
+            dir: { ...e.dir },
+            turn: { ...e.turn },
+            lastDouble: e.lastDouble,
+            afterElbow: e.afterElbow
+        };
+    }
+
+    private restoreGame(state: MatchState) {
+        const currentOrientation: Orientation = this.isLandscape ? 'landscape' : 'portrait';
+        const orientationChanged = state.orientation !== currentOrientation;
+
+        // 1) Manos y mazo (como objetos Tile, aún sin sprite)
+        this.players = state.hands.map((tiles, idx) => {
+            const hand = new PlayerHand(idx > 0);
+            tiles.forEach(td => hand.addTile(new Tile(td.v1, td.v2)));
+            return hand;
+        });
+        this.deck = state.deck.map(td => new Tile(td.v1, td.v2));
+
+        // 2) Valores simples
+        this.currentPlayerIndex = state.currentPlayerIndex;
+        this.passStreak = state.passStreak;
+        this.leftEndValue = state.leftEndValue;
+        this.rightEndValue = state.rightEndValue;
+        this.leftEnd = this.cloneEnd(state.leftEnd);
+        this.rightEnd = this.cloneEnd(state.rightEnd);
+        this.isProcessingTurn = false;
+
+        // 3) Transformar si cambió la orientación
+        let boardTilesData = state.boardTiles;
+        if (orientationChanged) {
+            boardTilesData = state.boardTiles.map(bt => ({
+                v1: bt.v1,
+                v2: bt.v2,
+                box: this.transformBox(bt.box, state.orientation),
+                // Rotación del sprite: CW suma +90°, CCW resta -90°
+                rotation: bt.rotation + (state.orientation === 'landscape' ? Math.PI / 2 : -Math.PI / 2)
+            }));
+            this.leftEnd = this.transformEnd(this.leftEnd, state.orientation);
+            this.rightEnd = this.transformEnd(this.rightEnd, state.orientation);
+        }
+
+        // 4) Reconstruir fichas del tablero
+        this.boardTiles = [];
+        this.boardBoxes = new Map();
+        this.occupied = new Set();
+        for (const bt of boardTilesData) {
+            const tile = new Tile(bt.v1, bt.v2);
+            tile.createSprite(this, 0, 0, 0);
+            tile.sprite.setScale(this.tileScale).setDepth(5);
+            (tile.sprite as Phaser.GameObjects.GameObject).disableInteractive();
+            tile.setFaceDown(false);
+            const center = this.boxCenterWorld(bt.box);
+            tile.sprite.setPosition(center.x, center.y);
+            tile.sprite.setRotation(bt.rotation);
+            this.occupy(bt.box);
+            this.boardTiles.push(tile);
+            this.boardBoxes.set(tile, { ...bt.box });
+        }
+
+        // 5) Manos de nuevo
         this.renderPlayerHand();
         this.renderBotHands();
-        this.startGame();
+
+        // 6) Reanudar turno
+        this.beginTurn();
+    }
+
+    // ---------- Transformaciones de orientación ----------
+    /**
+     * Landscape (60×20) → Portrait (20×60): rotación 90° CW del tablero.
+     * Portrait  (20×60) → Landscape (60×20): rotación 90° CCW.
+     * Fórmulas verificadas para que la ficha inicial quede idéntica.
+     */
+    private transformBox(box: Box, from: Orientation): Box {
+        if (from === 'landscape') {
+            return {
+                gx: TABLE_SHORT - box.gy - box.gh,
+                gy: box.gx,
+                gw: box.gh,
+                gh: box.gw
+            };
+        } else {
+            return {
+                gx: box.gy,
+                gy: TABLE_SHORT - box.gx - box.gw,
+                gw: box.gh,
+                gh: box.gw
+            };
+        }
+    }
+
+    private transformPos(p: GridPos, from: Orientation): GridPos {
+        if (from === 'landscape') {
+            return { gx: TABLE_SHORT - p.gy, gy: p.gx };
+        } else {
+            return { gx: p.gy, gy: TABLE_SHORT - p.gx };
+        }
+    }
+
+    private transformDir(d: Dir, from: Orientation): Dir {
+        if (from === 'landscape') {
+            // (dx, dy) → (-dy, dx)
+            return { dx: -d.dy, dy: d.dx };
+        } else {
+            // (dx, dy) → (dy, -dx)
+            return { dx: d.dy, dy: -d.dx };
+        }
+    }
+
+    private transformEnd(e: EndState, from: Orientation): EndState {
+        return {
+            head: this.transformPos(e.head, from),
+            dir: this.transformDir(e.dir, from),
+            turn: this.transformDir(e.turn, from),
+            lastDouble: e.lastDouble,
+            afterElbow: e.afterElbow
+        };
     }
 
     // ---------- Deck / manos ----------
@@ -214,9 +420,9 @@ export class MatchScene extends Scene {
         const s = this.safeArea;
         const off = (TILE_H * this.botScale) / 2 + 6;
         const positions = [
-            { x: s.x - off,           y: s.y + s.height / 2, rot:  Math.PI / 2 },
-            { x: s.x + s.width / 2,   y: s.y - off,          rot: 0 },
-            { x: s.right + off,       y: s.y + s.height / 2, rot: -Math.PI / 2 }
+            { x: s.x - off, y: s.y + s.height / 2, rot: Math.PI / 2 },
+            { x: s.x + s.width / 2, y: s.y - off, rot: 0 },
+            { x: s.right + off, y: s.y + s.height / 2, rot: -Math.PI / 2 }
         ];
         const spacing = TILE_W * this.botScale + 3;
         for (let i = 1; i <= 3; i++) {
@@ -248,8 +454,8 @@ export class MatchScene extends Scene {
 
     private boxInBounds(box: Box): boolean {
         return box.gx >= 0 && box.gy >= 0 &&
-               box.gx + box.gw <= this.gridCols &&
-               box.gy + box.gh <= this.gridRows;
+            box.gx + box.gw <= this.gridCols &&
+            box.gy + box.gh <= this.gridRows;
     }
 
     private boxFits(box: Box): boolean {
@@ -270,7 +476,7 @@ export class MatchScene extends Scene {
         };
     }
 
-    // ---------- Rotaciones (el sprite en rotation=0 está en vertical) ----------
+    // ---------- Rotaciones ----------
     private angleAlong(dir: Dir): number { return Math.atan2(-dir.dx, dir.dy); }
     private anglePerpendicular(dir: Dir): number { return Math.atan2(dir.dy, dir.dx); }
 
@@ -293,11 +499,7 @@ export class MatchScene extends Scene {
 
     private reverse(d: Dir): Dir { return { dx: 0 - d.dx, dy: 0 - d.dy }; }
 
-    // ---------- Cajas en la hilera ----------
-    /** Ficha normal en línea: 4 de largo a lo largo de dir, centrada en la línea. */
     private alongBox(end: EndState): Box { return this.frameBox(end, 0, LONG, -1, 1); }
-
-    /** Doble en línea: perpendicular a dir, centrado (4 de alto). */
     private perpBox(end: EndState): Box { return this.frameBox(end, 0, SHORT, -2, 2); }
 
     private advance(end: EndState, isDouble: boolean): EndState {
@@ -310,31 +512,17 @@ export class MatchScene extends Scene {
         };
     }
 
-    // ---------- Codo ----------
-    /**
-     * Ficha codo: vertical (a lo largo de turn), sobre las 2 columnas exteriores
-     * de la última ficha (u en [-2, 0]).
-     *  - Última ficha normal: pegada a su borde (v en [1, 5]).
-     *  - Última ficha doble:  pegada al borde del doble (v en [2, 6]).
-     */
     private elbowBox(end: EndState): Box {
         return end.lastDouble
             ? this.frameBox(end, -2, 0, 2, 6)
             : this.frameBox(end, -2, 0, 1, 5);
     }
 
-    /**
-     * Ficha que viene DESPUÉS del codo (arranca la hilera de regreso, en sentido contrario).
-     *  - Última ficha normal ("cap"): la normal queda ENCIMA del codo (v 5..7, u -4..0);
-     *    el doble va tumbado y centrado sobre el codo (u -3..1), o sea corrido 1 celda.
-     *  - Última ficha doble ("side"): la normal queda AL LADO de la mitad lejana del codo
-     *    (v 4..6, u -6..-2); el doble va tumbado y centrado debajo del codo (v 6..8, u -3..1).
-     */
     private postGeometry(end: EndState, isDouble: boolean) {
         const side = end.lastDouble;
         let u0: number, u1: number, v0: number, v1: number, headU: number, headV: number;
-        if (!side && !isDouble) { u0 = -4; u1 = 0;  v0 = 5; v1 = 7; headU = -4; headV = 6; }
-        else if (!side && isDouble) { u0 = -3; u1 = 1;  v0 = 5; v1 = 7; headU = -3; headV = 6; }
+        if (!side && !isDouble) { u0 = -4; u1 = 0; v0 = 5; v1 = 7; headU = -4; headV = 6; }
+        else if (!side && isDouble) { u0 = -3; u1 = 1; v0 = 5; v1 = 7; headU = -3; headV = 6; }
         else if (side && !isDouble) { u0 = -6; u1 = -2; v0 = 4; v1 = 6; headU = -6; headV = 5; }
         else { u0 = -3; u1 = 1; v0 = 6; v1 = 8; headU = -3; headV = 7; }
         return {
@@ -343,14 +531,13 @@ export class MatchScene extends Scene {
                 head: this.framePoint(end, headU, headV),
                 dir: this.reverse(end.dir),
                 turn: { ...end.turn },
-                lastDouble: false   // tanto la normal como el doble tumbado ocupan 2 de alto
+                lastDouble: false
             } as EndState
         };
     }
 
     private postBox(end: EndState, isDouble: boolean): Box { return this.postGeometry(end, isDouble).box; }
 
-    /** ¿Habrá sitio para la ficha siguiente al codo, sea normal o doble? */
     private postFeasible(end: EndState): boolean {
         return this.boxFits(this.postBox(end, false)) && this.boxFits(this.postBox(end, true));
     }
@@ -359,7 +546,6 @@ export class MatchScene extends Scene {
         return this.boxFits(this.alongBox(end));
     }
 
-    /** Después de esta ficha: ¿puede la próxima ir recta, o hacer codo con sitio para lo que sigue? */
     private canContinue(end: EndState): boolean {
         if (this.straightFits(end)) return true;
         return this.boxFits(this.elbowBox(end)) && this.postFeasible(end);
@@ -369,7 +555,6 @@ export class MatchScene extends Scene {
     private tryComputePlacement(tile: Tile, end: EndState): Placement | null {
         const isDouble = tile.isDouble;
 
-        // Ficha que va justo después del codo.
         if (end.afterElbow) {
             const g = this.postGeometry(end, isDouble);
             if (!this.boxFits(g.box)) return null;
@@ -390,11 +575,8 @@ export class MatchScene extends Scene {
         const natFits = this.boxFits(natural.box);
         const elbFits = this.boxFits(elbow.box);
 
-        // Se mira una ficha hacia adelante: si tras poner esta todavía hay continuación, seguir recto.
         if (natFits && this.canContinue(natural.newEnd)) return natural;
-        // Si no, esta ficha es el codo (siempre que también quede sitio después del codo).
         if (elbFits && this.postFeasible(end)) return elbow;
-        // Casos límite.
         if (natFits) return natural;
         if (elbFits) return elbow;
         return null;
@@ -413,8 +595,8 @@ export class MatchScene extends Scene {
     }
 
     private async placeInitialTile(tile: Tile, playerIndex: number) {
-        const cx = Math.floor(this.gridCols / 2);   // 30 -> columnas 30-31 (base 1)
-        const cy = Math.floor(this.gridRows / 2);   // 10 -> filas 9-12 (base 1) si es doble
+        const cx = Math.floor(this.gridCols / 2);
+        const cy = Math.floor(this.gridRows / 2);
         const isDouble = tile.isDouble;
 
         const mainDir: Dir = this.isLandscape ? { dx: 1, dy: 0 } : { dx: 0, dy: 1 };
@@ -423,23 +605,24 @@ export class MatchScene extends Scene {
         if (this.isLandscape) {
             box = isDouble
                 ? { gx: cx - 1, gy: cy - 2, gw: SHORT, gh: LONG }
-                : { gx: cx - 2, gy: cy - 1, gw: LONG,  gh: SHORT };
-            this.rightEnd = { head: { gx: box.gx + box.gw, gy: cy }, dir: { dx: 1,  dy: 0 }, turn: { dx: 0, dy: 1 },  lastDouble: isDouble };
-            this.leftEnd  = { head: { gx: box.gx,          gy: cy }, dir: { dx: -1, dy: 0 }, turn: { dx: 0, dy: -1 }, lastDouble: isDouble };
+                : { gx: cx - 2, gy: cy - 1, gw: LONG, gh: SHORT };
+            this.rightEnd = { head: { gx: box.gx + box.gw, gy: cy }, dir: { dx: 1, dy: 0 }, turn: { dx: 0, dy: 1 }, lastDouble: isDouble };
+            this.leftEnd = { head: { gx: box.gx, gy: cy }, dir: { dx: -1, dy: 0 }, turn: { dx: 0, dy: -1 }, lastDouble: isDouble };
         } else {
             box = isDouble
-                ? { gx: cx - 2, gy: cy - 1, gw: LONG,  gh: SHORT }
+                ? { gx: cx - 2, gy: cy - 1, gw: LONG, gh: SHORT }
                 : { gx: cx - 1, gy: cy - 2, gw: SHORT, gh: LONG };
-            this.rightEnd = { head: { gx: cx, gy: box.gy + box.gh }, dir: { dx: 0, dy: 1 },  turn: { dx: -1, dy: 0 }, lastDouble: isDouble };
-            this.leftEnd  = { head: { gx: cx, gy: box.gy },          dir: { dx: 0, dy: -1 }, turn: { dx: 1,  dy: 0 }, lastDouble: isDouble };
+            this.rightEnd = { head: { gx: cx, gy: box.gy + box.gh }, dir: { dx: 0, dy: 1 }, turn: { dx: -1, dy: 0 }, lastDouble: isDouble };
+            this.leftEnd = { head: { gx: cx, gy: box.gy }, dir: { dx: 0, dy: -1 }, turn: { dx: 1, dy: 0 }, lastDouble: isDouble };
         }
         const rotation = isDouble ? this.anglePerpendicular(mainDir) : this.angleAlong(mainDir);
 
-        this.leftEndValue  = tile.value1;
+        this.leftEndValue = tile.value1;
         this.rightEndValue = tile.value2;
 
         this.occupy(box);
         this.boardTiles.push(tile);
+        this.boardBoxes.set(tile, box);   // NUEVO
         await this.tweenTile(tile, this.boxCenterWorld(box), rotation);
         this.afterPlay(playerIndex);
     }
@@ -470,10 +653,11 @@ export class MatchScene extends Scene {
 
         this.occupy(placement.box);
         this.boardTiles.push(tile);
+        this.boardBoxes.set(tile, placement.box);   // NUEVO
 
         const outer = (tile.value1 === connecting) ? tile.value2 : tile.value1;
         if (isRight) { this.rightEnd = placement.newEnd; this.rightEndValue = outer; }
-        else         { this.leftEnd  = placement.newEnd; this.leftEndValue  = outer; }
+        else { this.leftEnd = placement.newEnd; this.leftEndValue = outer; }
 
         await this.tweenTile(tile, this.boxCenterWorld(placement.box), rotation);
         this.afterPlay(playerIndex);
@@ -492,9 +676,9 @@ export class MatchScene extends Scene {
     // ---------- Interacción humano ----------
     private canPlay(tile: Tile) {
         if (this.boardTiles.length === 0) return { left: true, right: true };
-        const mLeft  = tile.value1 === this.leftEndValue  || tile.value2 === this.leftEndValue;
+        const mLeft = tile.value1 === this.leftEndValue || tile.value2 === this.leftEndValue;
         const mRight = tile.value1 === this.rightEndValue || tile.value2 === this.rightEndValue;
-        const left  = mLeft  && this.tryComputePlacement(tile, this.leftEnd)  !== null;
+        const left = mLeft && this.tryComputePlacement(tile, this.leftEnd) !== null;
         const right = mRight && this.tryComputePlacement(tile, this.rightEnd) !== null;
         return { left, right };
     }
@@ -594,7 +778,9 @@ export class MatchScene extends Scene {
         this.players.forEach(h => h.tiles.forEach(t => t.setFaceDown(false)));
     }
 
+    // --- showRoundSummaryAndEnd: marca el final inmediatamente ---
     private showRoundSummaryAndEnd(winnerIndex: number, headline: string) {
+        this.isEnding = true;                            // <-- NUEVO: bloquea resize YA
         this.revealAllHands();
         const { width, height } = this.cameras.main;
         const summary = this.buildPipSummary();
@@ -634,7 +820,7 @@ export class MatchScene extends Scene {
                 played = true; break;
             }
             const { left, right } = this.canPlay(tile);
-            if (left)  { this.placeTileOnBoard(tile, idx, 'left');  played = true; break; }
+            if (left) { this.placeTileOnBoard(tile, idx, 'left'); played = true; break; }
             if (right) { this.placeTileOnBoard(tile, idx, 'right'); played = true; break; }
         }
         if (!played) {
@@ -643,7 +829,9 @@ export class MatchScene extends Scene {
         }
     }
 
+    // --- endGame: por si acaso, vuelve a bloquear resize ---
     private endGame(winnerIndex: number) {
+        this.isEnding = true;
         this.scene.start('GameOverScene', { score: winnerIndex === 0 ? 100 : 0 });
     }
 }

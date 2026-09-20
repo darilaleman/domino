@@ -1,5 +1,5 @@
 export const GAME_INFO = {
     id: 'cubaplay-domino',
-    name: 'DominÃ³ Cubano',
+    name: 'Dominó Cubano',
     version: '1.0.0'
 };
